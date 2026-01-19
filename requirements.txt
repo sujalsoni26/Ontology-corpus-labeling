@@ -1,0 +1,5 @@
+streamlit
+bcrypt
+filelock
+watchdog
+sqlite3

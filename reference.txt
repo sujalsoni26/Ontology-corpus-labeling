@@ -1,0 +1,622 @@
+# prop_sentence_labeler.py
+# Gradio 4.x app for labeling property-specific sentences with 5 exclusive categories.
+# Output mirrors the input structure, except "texts" becomes a dict: { sentence_str: label_code or "" }.
+# Default output file name is <input_basename>_label.json if none is specified.
+#
+# Label codes:
+#   pdr = Full alignment p(D, R)
+#   pd  = Property expressed with correct Domain p(D, ?)
+#   pr  = Property expressed with correct Range  p(?, R)
+#   p   = Property expressed (incorrect D and R) p(?, ?)
+#   n   = No alignment
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import threading
+import time
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+# Ensure proxies don’t intercept localhost self-checks
+os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
+os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
+
+import gradio as gr
+from rapidfuzz import process, fuzz
+
+# ----------------------------
+# UI CONSTANTS & MAPPINGS
+# ----------------------------
+LABEL_DISPLAY_TO_CODE = {
+    "i. Full alignment p(D, R)": "pdr",
+    "ii. Property expressed with correct Domain p(D, ?)": "pd",
+    "iii. Property expressed with correct Range p(?, R)": "pr",
+    "iv. Property expressed with incorrect domain and range p(?, ?)": "p",
+    "v. No alignment": "n",
+}
+CODE_TO_LABEL_DISPLAY = {v: k for k, v in LABEL_DISPLAY_TO_CODE.items()}
+LABEL_CHOICES = list(LABEL_DISPLAY_TO_CODE.keys())
+
+INFO_LEGEND = """**Legend → code mapping**
+- i. Full alignment p(D, R) → `pdr`  
+- ii. Correct Domain p(D, ?) → `pd`  
+- iii. Correct Range p(?, R) → `pr`  
+- iv. Incorrect D & R p(?, ?) → `p`  
+- v. No alignment → `n`
+"""
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def _safe_read_json(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+def _safe_write_json(path: Path, obj: dict) -> None:
+    tmp = path.with_suffix(f".tmp.{int(time.time())}.json")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    tmp.replace(path)
+
+def _default_out_path(inp: Path) -> Path:
+    stem = inp.stem
+    suffix = inp.suffix if inp.suffix else ".json"
+    return inp.with_name(f"{stem}_label{suffix}")
+
+def _make_empty_labels_for_property(texts: List[str]) -> Dict[str, str]:
+    return {t: "" for t in texts}
+
+def _merge_existing_labels(texts: List[str], existing: Dict[str, str]) -> Dict[str, str]:
+    merged = {t: "" for t in texts}
+    for t, lab in existing.items():
+        if t in merged:
+            merged[t] = lab or ""
+    return merged
+
+def _stats_for_property(texts: List[str], labels: Dict[str, str]) -> Tuple[int, int, float]:
+    total = len(texts)
+    labeled = sum(1 for t in texts if labels.get(t, "") != "")
+    pct = round((labeled / total * 100.0), 2) if total else 0.0
+    return labeled, total, pct
+
+def _clamp(i: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, i))
+
+def _jump_unlabeled(texts: List[str], labels: Dict[str, str], start: int, direction: int) -> int:
+    """
+    Find next unlabeled index from 'start' moving in 'direction' (+1 or -1).
+    If none found, return 'start' (stay put).
+    """
+    n = len(texts)
+    if n == 0:
+        return 0
+    if direction > 0:
+        rng = range(start + 1, n, 1)
+    else:
+        rng = range(start - 1, -1, -1)
+    for j in rng:
+        if labels.get(texts[j], "") == "":
+            return j
+    return start  # no jump possible
+
+def _make_output_object(data_raw: Dict, labels: Dict[str, Dict[str, str]]) -> Dict:
+    """
+    - same top-level keys (properties)
+    - keep "domain", "range"
+    - "texts" => dict { sentence: label_code or "" }
+    """
+    out = {}
+    for prop, body in data_raw.items():
+        texts = body.get("texts", [])
+        labdict = labels.get(prop, {})
+        merged = _merge_existing_labels(texts, labdict)
+        out[prop] = {
+            "domain": body.get("domain", ""),
+            "range": body.get("range", ""),
+            "texts": merged,
+        }
+    return out
+
+# ----------------------------
+# GRADIO CALLBACKS
+# ----------------------------
+def load_data(file_in, out_name_text, out_file_in):
+    """
+    Initializes app state after selecting input (and optional existing output).
+    Decide:
+      - where to load labels FROM (load_from_path)
+      - where to save TO (save_to_path)
+    Priority:
+      load_from = out_file_in (if provided) else default_out (if exists) else None (start fresh)
+      save_to   = out_name_text (if provided) else (out_file_in if provided) else default_out
+    """
+    if file_in is None:
+        gr.Warning("Please select an input JSON file.")
+        return (
+            gr.update(choices=[], value=None), "", "", None, "", "", "",
+            "", "", "",  # paths
+            {}, {}, {}, [], "", False  # states + current_sentence + suppress flag
+        )
+
+    inp_path = Path(file_in.name)
+    try:
+        raw = _safe_read_json(inp_path)
+    except Exception as e:
+        gr.Error(f"Failed to read JSON: {e}")
+        return (
+            gr.update(choices=[], value=None), "", "", None, "", "", "",
+            "", "", "",
+            {}, {}, {}, [], "", False
+        )
+
+    # normalize input
+    data_raw = {}
+    for prop, body in raw.items():
+        if not isinstance(body, dict):
+            continue
+        domain = body.get("domain", "")
+        rng = body.get("range", "")
+        texts = body.get("texts", [])
+        if not isinstance(texts, list):
+            texts = list(texts.keys())
+        data_raw[prop] = {"domain": domain, "range": rng, "texts": texts}
+
+    prop_list = sorted(list(data_raw.keys()))
+    if not prop_list:
+        gr.Warning("No properties found in input.")
+        return (
+            gr.update(choices=[], value=None), "", "", None, "", "", "",
+            "", "", "",
+            {}, {}, {}, [], "", False
+        )
+
+    # Resolve load_from_path and save_to_path
+    default_out = _default_out_path(inp_path)
+
+    load_from_path = None
+    if out_file_in is not None:
+        load_from_path = Path(out_file_in.name)
+    elif default_out.exists():
+        load_from_path = default_out
+
+    if out_name_text and out_name_text.strip():
+        save_to_path = Path(out_name_text.strip())
+        if save_to_path.is_dir():
+            save_to_path = save_to_path / default_out.name
+    elif out_file_in is not None:
+        save_to_path = Path(out_file_in.name)
+    else:
+        save_to_path = default_out
+
+    # Build labels structure
+    labels = {}
+    if load_from_path and load_from_path.exists():
+        try:
+            existing_out = _safe_read_json(load_from_path)
+            for prop in prop_list:
+                texts = data_raw[prop]["texts"]
+                prev = {}
+                if prop in existing_out and isinstance(existing_out[prop], dict):
+                    tdict = existing_out[prop].get("texts", {})
+                    if isinstance(tdict, dict):
+                        prev = {k: (v or "") for k, v in tdict.items()}
+                labels[prop] = _merge_existing_labels(texts, prev)
+        except Exception:
+            for prop in prop_list:
+                labels[prop] = _make_empty_labels_for_property(data_raw[prop]["texts"])
+    else:
+        for prop in prop_list:
+            labels[prop] = _make_empty_labels_for_property(data_raw[prop]["texts"])
+
+    # Current index per property → first unlabeled if any, else 0
+    idx_map = {}
+    for prop in prop_list:
+        texts = data_raw[prop]["texts"]
+        init = 0
+        for j, t in enumerate(texts):
+            if labels[prop].get(t, "") == "":
+                init = j
+                break
+        idx_map[prop] = init
+
+    # Prime UI with first property
+    first_prop = prop_list[0]
+    dom = data_raw[first_prop]["domain"]
+    rng = data_raw[first_prop]["range"]
+    idx = idx_map[first_prop]
+    texts = data_raw[first_prop]["texts"]
+    sent = texts[idx] if texts else ""
+    code = labels[first_prop].get(sent, "")
+    radio_value = CODE_TO_LABEL_DISPLAY.get(code, None)
+
+    labeled, total, pct = _stats_for_property(texts, labels[first_prop])
+    header = f"### **{first_prop}**  \nDomain: **{dom}** | Range: **{rng}**"
+    progress = f"{idx+1}/{total}" if total else "0/0"
+    status = f"Labeled: **{labeled}** / **{total}**  ({pct}%)"
+
+    # suppress autosave while UI initializes
+    suppress = True
+
+    return (
+        gr.update(choices=prop_list, value=first_prop),  # dropdown
+        header,                                          # header md
+        sent,                                            # sentence
+        radio_value,                                     # radio selection
+        progress,                                        # progress text
+        status,                                          # stats md
+        str(inp_path),                                   # input path
+        str(load_from_path) if load_from_path else "",   # loaded-from path (optional)
+        str(save_to_path),                               # save-to path
+        str(default_out),                                # suggested default
+        data_raw, labels, idx_map, prop_list,            # states
+        sent,                                            # current sentence state
+        suppress                                         # suppress autosave flag
+    )
+
+def filter_properties(search_text, prop_list):
+    if not prop_list:
+        return gr.update(choices=[], value=None)
+    query = (search_text or "").strip()
+    if not query:
+        return gr.update(choices=prop_list, value=None)
+    matches = process.extract(query, prop_list, scorer=fuzz.WRatio, limit=50)
+    choices = [m[0] for m in matches]
+    return gr.update(choices=choices, value=None)
+
+def select_property(prop, data_raw, labels, idx_map):
+    """Return header, sentence, radio_value, progress, status, suppress=True"""
+    if not prop or not data_raw or prop not in data_raw:
+        return "", "", None, "", "", True
+    dom = data_raw[prop]["domain"]
+    rng = data_raw[prop]["range"]
+    header = f"### **{prop}**  \nDomain: **{dom}** | Range: **{rng}**"
+
+    texts = data_raw[prop]["texts"]
+    if not texts:
+        return header, "(No sentences)", None, "0/0", "Labeled: **0** / **0** (0%)", True
+
+    idx = _clamp(idx_map.get(prop, 0), 0, len(texts)-1)
+    sent = texts[idx]
+    code = labels[prop].get(sent, "")
+    radio_value = CODE_TO_LABEL_DISPLAY.get(code, None)
+    labeled, total, pct = _stats_for_property(texts, labels[prop])
+    progress = f"{idx+1}/{total}"
+    status = f"Labeled: **{labeled}** / **{total}**  ({pct}%)"
+    return header, sent, radio_value, progress, status, True  # suppress during programmatic update
+
+def _show_at(prop, data_raw, labels, idx_map):
+    texts = data_raw[prop]["texts"]
+    if not texts:
+        return "(No sentences)", None, "0/0", "Labeled: **0** / **0** (0%)", True
+    idx = _clamp(idx_map[prop], 0, len(texts)-1)
+    idx_map[prop] = idx
+    sent = texts[idx]
+    code = labels[prop].get(sent, "")
+    radio_value = CODE_TO_LABEL_DISPLAY.get(code, None)
+    labeled, total, pct = _stats_for_property(texts, labels[prop])
+    progress = f"{idx+1}/{total}"
+    status = f"Labeled: **{labeled}** / **{total}**  ({pct}%)"
+    return sent, radio_value, progress, status, True  # suppress during programmatic update
+
+def go_prev(prop, data_raw, labels, idx_map):
+    if not prop or prop not in data_raw:
+        return "", None, "", "", True
+    idx_map[prop] = _clamp(idx_map[prop] - 1, 0, max(0, len(data_raw[prop]["texts"]) - 1))
+    return _show_at(prop, data_raw, labels, idx_map)
+
+def go_next(prop, data_raw, labels, idx_map):
+    if not prop or prop not in data_raw:
+        return "", None, "", "", True
+    idx_map[prop] = _clamp(idx_map[prop] + 1, 0, max(0, len(data_raw[prop]["texts"]) - 1))
+    return _show_at(prop, data_raw, labels, idx_map)
+
+def jump_prev_unlabeled(prop, data_raw, labels, idx_map):
+    if not prop or prop not in data_raw:
+        return "", None, "", "", True
+    texts = data_raw[prop]["texts"]
+    if not texts:
+        return "(No sentences)", None, "0/0", "Labeled: **0** / **0** (0%)", True
+    current = idx_map[prop]
+    target = _jump_unlabeled(texts, labels[prop], current, direction=-1)
+    idx_map[prop] = target
+    return _show_at(prop, data_raw, labels, idx_map)
+
+def jump_next_unlabeled(prop, data_raw, labels, idx_map):
+    if not prop or prop not in data_raw:
+        return "", None, "", "", True
+    texts = data_raw[prop]["texts"]
+    if not texts:
+        return "(No sentences)", None, "0/0", "Labeled: **0** / **0** (0%)", True
+    current = idx_map[prop]
+    target = _jump_unlabeled(texts, labels[prop], current, direction=+1)
+    idx_map[prop] = target
+    return _show_at(prop, data_raw, labels, idx_map)
+
+def unset_suppress():
+    return False
+
+def set_current_sentence(sent):
+    return sent
+
+def save_label(prop, current_sentence, chosen_display_label, data_raw, labels, idx_map, file_out_path, suppress_autosave):
+    """
+    Save only when NOT suppressed (i.e., actual user selection).
+    """
+    if suppress_autosave:
+        # Ignore any change fired due to programmatic UI updates
+        return labels, gr.update(), gr.update()
+
+    if not prop or not current_sentence or chosen_display_label is None:
+        return labels, gr.update(), gr.update()
+
+    code = LABEL_DISPLAY_TO_CODE.get(chosen_display_label, "")
+    labels[prop][current_sentence] = code
+
+    out_path = Path(file_out_path)
+    out_obj = _make_output_object(data_raw, labels)
+    try:
+        _safe_write_json(out_path, out_obj)
+        save_status = gr.update(value="✓ Saved", visible=True)
+    except Exception as e:
+        save_status = gr.update(value=f"✗ Save failed: {e}", visible=True)
+
+    texts = data_raw[prop]["texts"]
+    labeled, total, pct = _stats_for_property(texts, labels[prop])
+    status = gr.update(value=f"Labeled: **{labeled}** / **{total}**  ({pct}%)")
+    return labels, status, save_status
+
+def save_snapshot(file_out_path, data_raw, labels):
+    if not file_out_path:
+        return "✗ No save-to path."
+    out_path = Path(file_out_path)
+    try:
+        out_obj = _make_output_object(data_raw, labels)
+        _safe_write_json(out_path, out_obj)
+        return "✓ Saved snapshot."
+    except Exception as e:
+        return f"✗ Save failed: {e}"
+
+def download_snapshot(file_out_path, data_raw, labels):
+    """
+    Write a timestamped snapshot in the working dir and return its path
+    so the gr.File component serves it as a download.
+    """
+    ts_path = Path(f"snapshot_{int(time.time())}.json")
+    try:
+        out_obj = _make_output_object(data_raw, labels)
+        _safe_write_json(ts_path, out_obj)
+        return str(ts_path)
+    except Exception:
+        return None
+
+def save_backup_to_path(backup_path_text, data_raw, labels):
+    """
+    Save a copy to a user-specified path (textbox). Creates parent dirs if needed.
+    """
+    if not backup_path_text or not backup_path_text.strip():
+        return "✗ Provide a backup path (e.g., C:\\path\\to\\file.json)"
+    try:
+        backup_path = Path(backup_path_text.strip())
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        out_obj = _make_output_object(data_raw, labels)
+        _safe_write_json(backup_path, out_obj)
+        return f"✓ Backup saved to: {backup_path}"
+    except Exception as e:
+        return f"✗ Backup failed: {e}"
+
+def shutdown_app():
+    """
+    Gracefully exit the app/server.
+    """
+    def _kill():
+        time.sleep(0.5)
+        os._exit(0)
+    threading.Thread(target=_kill, daemon=True).start()
+    return "Shutting down..."
+
+# ----------------------------
+# BUILD UI
+# ----------------------------
+with gr.Blocks(title="Property Sentence Labeler") as demo:
+    gr.Markdown("# Property → Sentence Labeler")
+    gr.Markdown(
+        "Load an input JSON, optionally pick an **existing output JSON**, and assign one of the five labels to each sentence. "
+        "Use **Jump** to hop to nearest *unlabeled* sentence. Output mirrors input but `texts` becomes a dictionary "
+        "mapping sentence → label code (or empty string)."
+    )
+
+    with gr.Row():
+        file_in = gr.File(label="Input JSON", file_types=[".json"])
+        out_file_in = gr.File(label="Existing output JSON (optional)", file_types=[".json"])
+        out_name = gr.Textbox(label="Save-to path (optional)", placeholder="Leave empty to auto-create <input>_label.json")
+
+    with gr.Row():
+        load_btn = gr.Button("Load Data", variant="primary")
+        inp_path_txt = gr.Textbox(label="Input path", interactive=False)
+        loaded_from_txt = gr.Textbox(label="Loaded-from output path", interactive=False)
+        out_path_txt = gr.Textbox(label="Current Save-to path", interactive=True)
+        default_out_txt = gr.Textbox(label="Suggested default path", interactive=False)
+
+    with gr.Accordion("Property selection", open=True):
+        with gr.Row():
+            search = gr.Textbox(label="Search property (type to filter)", placeholder="e.g., absoluteMagnitude")
+            prop_dd = gr.Dropdown(label="Properties", choices=[], value=None)
+
+    header_md = gr.Markdown("")
+    gr.Markdown(INFO_LEGEND)
+
+    with gr.Row():
+        with gr.Column(min_width=160):
+            progress_txt = gr.Textbox(label="Progress", interactive=False)
+        with gr.Column():
+            stats_md = gr.Markdown("")
+
+    sentence_tb = gr.Textbox(label="Sentence to label", lines=6, interactive=False)
+    radio = gr.Radio(label="Select one label", choices=LABEL_CHOICES, value=None)
+
+    with gr.Row():
+        jb = gr.Button("⏮️ Jump back (previous unlabeled)")
+        prevb = gr.Button("⬅️ Previous")
+        nextb = gr.Button("Next ➡️")
+        jf = gr.Button("Jump forward (next unlabeled) ⏭️")
+
+    with gr.Row():
+        save_btn = gr.Button("💾 Save Snapshot")
+        download_btn = gr.Button("⬇️ Download Snapshot")
+        download_file = gr.File(label="Download file", interactive=False)
+
+    with gr.Row():
+        backup_path = gr.Textbox(label="Backup path (optional)", placeholder=r"C:\path\to\backup.json")
+        backup_btn = gr.Button("Save Backup to Path")
+        backup_status = gr.Textbox(label="Backup status", interactive=False)
+
+    with gr.Row():
+        exit_btn = gr.Button("Exit")
+        exit_status = gr.Textbox(label="Exit status", interactive=False)
+
+    # Hidden app-state
+    data_raw_state = gr.State({})
+    labels_state = gr.State({})
+    idx_map_state = gr.State({})
+    prop_list_state = gr.State([])
+    current_sentence_state = gr.State("")
+    suppress_autosave_state = gr.State(False)
+
+    # --- Wire up events ---
+    load_btn.click(
+        fn=load_data,
+        inputs=[file_in, out_name, out_file_in],
+        outputs=[
+            prop_dd, header_md, sentence_tb, radio,
+            progress_txt, stats_md,
+            inp_path_txt, loaded_from_txt, out_path_txt, default_out_txt,
+            data_raw_state, labels_state, idx_map_state, prop_list_state,
+            current_sentence_state, suppress_autosave_state
+        ],
+    ).then(
+        fn=unset_suppress,
+        inputs=[],
+        outputs=[suppress_autosave_state]
+    )
+
+    search.input(
+        fn=filter_properties,
+        inputs=[search, prop_list_state],
+        outputs=prop_dd
+    )
+
+    prop_dd.change(
+        fn=select_property,
+        inputs=[prop_dd, data_raw_state, labels_state, idx_map_state],
+        outputs=[header_md, sentence_tb, radio, progress_txt, stats_md, suppress_autosave_state],
+    ).then(
+        fn=set_current_sentence,
+        inputs=[sentence_tb],
+        outputs=[current_sentence_state]
+    ).then(
+        fn=unset_suppress,
+        inputs=[],
+        outputs=[suppress_autosave_state]
+    )
+
+    # Autosave on radio change, but only if NOT suppressed
+    radio.change(
+        fn=save_label,
+        inputs=[prop_dd, current_sentence_state, radio,
+                data_raw_state, labels_state, idx_map_state, out_path_txt, suppress_autosave_state],
+        outputs=[labels_state, stats_md, backup_status],  # reuse backup_status box as a generic save status message
+    )
+
+    # Navigation: set suppress=True during programmatic UI updates; clear after
+    prevb.click(
+        fn=go_prev,
+        inputs=[prop_dd, data_raw_state, labels_state, idx_map_state],
+        outputs=[sentence_tb, radio, progress_txt, stats_md, suppress_autosave_state],
+    ).then(
+        fn=set_current_sentence,
+        inputs=[sentence_tb],
+        outputs=[current_sentence_state]
+    ).then(
+        fn=unset_suppress,
+        inputs=[],
+        outputs=[suppress_autosave_state]
+    )
+
+    nextb.click(
+        fn=go_next,
+        inputs=[prop_dd, data_raw_state, labels_state, idx_map_state],
+        outputs=[sentence_tb, radio, progress_txt, stats_md, suppress_autosave_state],
+    ).then(
+        fn=set_current_sentence,
+        inputs=[sentence_tb],
+        outputs=[current_sentence_state]
+    ).then(
+        fn=unset_suppress,
+        inputs=[],
+        outputs=[suppress_autosave_state]
+    )
+
+    jb.click(
+        fn=jump_prev_unlabeled,
+        inputs=[prop_dd, data_raw_state, labels_state, idx_map_state],
+        outputs=[sentence_tb, radio, progress_txt, stats_md, suppress_autosave_state],
+    ).then(
+        fn=set_current_sentence,
+        inputs=[sentence_tb],
+        outputs=[current_sentence_state]
+    ).then(
+        fn=unset_suppress,
+        inputs=[],
+        outputs=[suppress_autosave_state]
+    )
+
+    jf.click(
+        fn=jump_next_unlabeled,
+        inputs=[prop_dd, data_raw_state, labels_state, idx_map_state],
+        outputs=[sentence_tb, radio, progress_txt, stats_md, suppress_autosave_state],
+    ).then(
+        fn=set_current_sentence,
+        inputs=[sentence_tb],
+        outputs=[current_sentence_state]
+    ).then(
+        fn=unset_suppress,
+        inputs=[],
+        outputs=[suppress_autosave_state]
+    )
+
+    # Save & downloads
+    save_btn.click(
+        fn=save_snapshot,
+        inputs=[out_path_txt, data_raw_state, labels_state],
+        outputs=[backup_status]
+    )
+
+    download_btn.click(
+        fn=download_snapshot,
+        inputs=[out_path_txt, data_raw_state, labels_state],
+        outputs=[download_file]
+    )
+
+    backup_btn.click(
+        fn=save_backup_to_path,
+        inputs=[backup_path, data_raw_state, labels_state],
+        outputs=[backup_status]
+    )
+
+    # Exit
+    exit_btn.click(
+        fn=shutdown_app,
+        inputs=[],
+        outputs=[exit_status]
+    )
+
+# Launch: prefer local; fall back to share if localhost blocked
+if __name__ == "__main__":
+    try:
+        demo.launch(server_name="127.0.0.1", server_port=7860, share=False, inbrowser=True, show_error=True)
+    except ValueError as e:
+        print("Localhost not accessible; retrying with share=True. Error:", e)
+        demo.launch(server_name="0.0.0.0", server_port=7860, share=True, inbrowser=False, show_error=True)
