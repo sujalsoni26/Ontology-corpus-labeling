@@ -8,14 +8,40 @@ from typing import Dict, List, Optional
 from utils import calculate_stats, CODE_TO_LABEL_DISPLAY
 
 
-def render_property_header(prop: str, domain: str, range_val: str):
-    """Render the property header with domain and range information."""
-    st.markdown(f"### **{prop}**")
+def render_property_header(prop: str, domain: str, range_val: str, 
+                          property_iri: str = None, domain_iri: str = None, range_iri: str = None):
+    """
+    Render the property header with domain and range information.
+    Makes property, domain, and range names clickable if IRIs are provided.
+    
+    Args:
+        prop: Property name
+        domain: Domain class name
+        range_val: Range class name
+        property_iri: Optional IRI/URL for the property
+        domain_iri: Optional IRI/URL for the domain class
+        range_iri: Optional IRI/URL for the range class
+    """
+    # Render property name (clickable if IRI exists)
+    if property_iri:
+        st.markdown(f"### **[{prop}]({property_iri})** 🔗", unsafe_allow_html=True)
+    else:
+        st.markdown(f"### **{prop}**")
+    
+    # Render domain and range in columns
     col1, col2 = st.columns(2)
+    
     with col1:
-        st.markdown(f"**Domain:** {domain}")
+        if domain_iri:
+            st.markdown(f"**Domain:** [{domain}]({domain_iri}) 🔗", unsafe_allow_html=True)
+        else:
+            st.markdown(f"**Domain:** {domain}")
+    
     with col2:
-        st.markdown(f"**Range:** {range_val}")
+        if range_iri:
+            st.markdown(f"**Range:** [{range_val}]({range_iri}) 🔗", unsafe_allow_html=True)
+        else:
+            st.markdown(f"**Range:** {range_val}")
 
 def render_progress_stats(current_idx: int, texts: List[str], labels: Dict[str, str]):
     """Render progress and statistics information."""
@@ -160,8 +186,7 @@ def render_user_info(username: str, stats: Dict):
     st.sidebar.markdown(f"**Logged in as:** {username}")
     
     if stats:
-        st.sidebar.metric("Total Labels", stats.get("total_labels", 0))
-        st.sidebar.metric("Properties Labeled", stats.get("properties_count", 0))
+        st.sidebar.metric("Sentences Labeled", stats.get("sentences_labeled", 0))
     
     if st.sidebar.button("🚪 Logout", use_container_width=True):
         # Clear session state
@@ -170,66 +195,66 @@ def render_user_info(username: str, stats: Dict):
         st.rerun()
 
 def render_word_selection_interface(sentence: str, selected_subject: List[int], 
-                                   selected_property: List[int], selected_object: List[int],
+                                   selected_object: List[int],
                                    key_prefix: str = "word_sel",
                                    session_state_key: tuple = None):
     """
-    Render token-based word selection interface with Subject/Property/Object modes.
+    Render token-based word selection interface with Subject/Object modes.
+    Uses first/last word selection for multi-word spans.
     
     Args:
         sentence: The sentence to tokenize and display
         selected_subject: List of word indices selected as subject
-        selected_property: List of word indices selected as property
         selected_object: List of word indices selected as object
         key_prefix: Unique key prefix for this instance
         session_state_key: Tuple of (prop, sentence) to update session state directly
         
     Returns:
-        Tuple of (selection_mode, updated_subject, updated_property, updated_object)
+        Tuple of (selection_mode, updated_subject, updated_object)
     """
     # Tokenize sentence into words
     words = sentence.split()
     
     # Selection mode buttons
     st.markdown("#### 🎯 Word Selection Mode")
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3 = st.columns(3)
     
     with col1:
         subject_mode = st.button("📘 Subject", key=f"{key_prefix}_subject_btn", 
                                 use_container_width=True,
                                 type="primary" if st.session_state.get(f"{key_prefix}_mode") == "subject" else "secondary")
     with col2:
-        property_mode = st.button("📗 Property", key=f"{key_prefix}_property_btn",
-                                 use_container_width=True,
-                                 type="primary" if st.session_state.get(f"{key_prefix}_mode") == "property" else "secondary")
-    with col3:
         object_mode = st.button("📙 Object", key=f"{key_prefix}_object_btn",
                                use_container_width=True,
                                type="primary" if st.session_state.get(f"{key_prefix}_mode") == "object" else "secondary")
-    with col4:
+    with col3:
         clear_mode = st.button("🔄 Clear Mode", key=f"{key_prefix}_clear_btn",
                               use_container_width=True)
     
     # Update selection mode
     if subject_mode:
         st.session_state[f"{key_prefix}_mode"] = "subject"
-        st.rerun()
-    elif property_mode:
-        st.session_state[f"{key_prefix}_mode"] = "property"
+        st.session_state[f"{key_prefix}_first_word"] = None  # Reset first word
         st.rerun()
     elif object_mode:
         st.session_state[f"{key_prefix}_mode"] = "object"
+        st.session_state[f"{key_prefix}_first_word"] = None  # Reset first word
         st.rerun()
     elif clear_mode:
         st.session_state[f"{key_prefix}_mode"] = None
+        st.session_state[f"{key_prefix}_first_word"] = None
         st.rerun()
     
     current_mode = st.session_state.get(f"{key_prefix}_mode")
+    first_word_idx = st.session_state.get(f"{key_prefix}_first_word")
     
-    # Display current mode
+    # Display current mode with instructions
     if current_mode:
-        mode_labels = {"subject": "📘 Subject", "property": "📗 Property", "object": "📙 Object"}
-        st.info(f"**Active Mode:** {mode_labels.get(current_mode)} - Click words to select/deselect")
+        mode_labels = {"subject": "📘 Subject", "object": "📙 Object"}
+        if first_word_idx is None:
+            st.info(f"**Active Mode:** {mode_labels.get(current_mode)} - Click the **first word** of the span")
+        else:
+            st.info(f"**Active Mode:** {mode_labels.get(current_mode)} - Click the **last word** of the span (First word: '{words[first_word_idx]}')")
     else:
         st.info("**Select a mode above to start marking words**")
     
@@ -247,17 +272,6 @@ def render_word_selection_interface(sentence: str, selected_subject: List[int],
         border-color: #357ABD !important;
     }
     
-    /* Property buttons - Green */
-    div[data-testid="column"] button[kind="primary"].property-btn {
-        background-color: #50C878 !important;
-        border-color: #50C878 !important;
-        color: white !important;
-    }
-    div[data-testid="column"] button[kind="primary"].property-btn:hover {
-        background-color: #3DA35D !important;
-        border-color: #3DA35D !important;
-    }
-    
     /* Object buttons - Orange */
     div[data-testid="column"] button[kind="primary"].object-btn {
         background-color: #FF8C42 !important;
@@ -268,11 +282,17 @@ def render_word_selection_interface(sentence: str, selected_subject: List[int],
         background-color: #E67A35 !important;
         border-color: #E67A35 !important;
     }
+    
+    /* First word indicator - Yellow border */
+    .first-word-indicator {
+        border: 3px solid #FFD700 !important;
+        box-shadow: 0 0 10px rgba(255, 215, 0, 0.5) !important;
+    }
     </style>
     """, unsafe_allow_html=True)
     
     # Render clickable word tokens
-    st.markdown("#### Sentence (Click words to select)")
+    st.markdown("#### Sentence (Click first word, then last word)")
     
     # Render words as buttons in columns
     cols = st.columns(min(len(words), 10))  # Max 10 columns per row
@@ -282,100 +302,111 @@ def render_word_selection_interface(sentence: str, selected_subject: List[int],
         
         # Determine button style and color based on selection
         is_subject = idx in selected_subject
-        is_property = idx in selected_property
         is_object = idx in selected_object
+        is_first_word = (first_word_idx == idx)
         
         # Create button with appropriate styling
         if is_subject:
-            # Blue background for subject
             button_label = word
             button_type = "primary"
-            # Add CSS class identifier in the key
             css_class = "subject-word"
-        elif is_property:
-            # Green background for property
-            button_label = word
-            button_type = "primary"
-            css_class = "property-word"
+            bg_color = "#4A90E2"  # Blue
         elif is_object:
-            # Orange background for object
             button_label = word
             button_type = "primary"
             css_class = "object-word"
+            bg_color = "#FF8C42"  # Orange
         else:
             button_label = word
             button_type = "secondary"
             css_class = "unselected-word"
+            bg_color = None
         
         with cols[col_idx]:
             # Use markdown with colored background for selected words
-            if is_subject or is_property or is_object:
-                # Determine color
-                if is_subject:
-                    bg_color = "#4A90E2"  # Blue
-                elif is_property:
-                    bg_color = "#50C878"  # Green
-                else:  # is_object
-                    bg_color = "#FF8C42"  # Orange
+            if is_subject or is_object:
+                # Add yellow border if this is the first word
+                border_style = "border: 3px solid #FFD700; box-shadow: 0 0 10px rgba(255, 215, 0, 0.5);" if is_first_word else ""
                 
                 # Display colored badge
                 st.markdown(f"""
                 <div style="background-color: {bg_color}; color: white; padding: 8px 12px; 
                             border-radius: 6px; text-align: center; margin-bottom: 4px; 
-                            font-weight: 500; cursor: pointer;">
+                            font-weight: 500; cursor: pointer; {border_style}">
                     {word}
                 </div>
                 """, unsafe_allow_html=True)
+            elif is_first_word:
+                # Show first word indicator for unselected words
+                st.markdown(f"""
+                <div style="background-color: #FFF9C4; color: #333; padding: 8px 12px; 
+                            border: 3px solid #FFD700; border-radius: 6px; text-align: center; 
+                            margin-bottom: 4px; font-weight: 500; cursor: pointer;
+                            box-shadow: 0 0 10px rgba(255, 215, 0, 0.5);">
+                    {word} (First)
+                </div>
+                """, unsafe_allow_html=True)
             
-            # Always render the button (invisible if colored badge shown)
-            if st.button(button_label if not (is_subject or is_property or is_object) else f"✓ {word}", 
+            # Always render the button
+            button_display = f"✓ {word}" if (is_subject or is_object) else (f"→ {word}" if is_first_word else word)
+            if st.button(button_display, 
                         key=f"{key_prefix}_word_{idx}", 
                         type=button_type, 
                         use_container_width=True,
                         disabled=False):
                 # Handle word click based on current mode
-                # Update session state BEFORE rerun
                 if session_state_key and current_mode:
                     prop, sentence = session_state_key
                     current_selections = st.session_state.word_selections[prop][sentence]
                     
-                    if current_mode == "subject":
-                        if idx in current_selections["subject"]:
-                            current_selections["subject"].remove(idx)
-                        else:
-                            current_selections["subject"].append(idx)
-                            # Remove from other categories
-                            if idx in current_selections["property"]:
-                                current_selections["property"].remove(idx)
-                            if idx in current_selections["object"]:
-                                current_selections["object"].remove(idx)
+                    if first_word_idx is None:
+                        # First click - store the first word index
+                        st.session_state[f"{key_prefix}_first_word"] = idx
+                        st.rerun()
+                    else:
+                        # Second click - select range from first to last
+                        start_idx = min(first_word_idx, idx)
+                        end_idx = max(first_word_idx, idx)
                         
-                    elif current_mode == "property":
-                        if idx in current_selections["property"]:
-                            current_selections["property"].remove(idx)
-                        else:
-                            current_selections["property"].append(idx)
-                            # Remove from other categories
-                            if idx in current_selections["subject"]:
-                                current_selections["subject"].remove(idx)
-                            if idx in current_selections["object"]:
-                                current_selections["object"].remove(idx)
+                        # Create range of indices
+                        selected_range = list(range(start_idx, end_idx + 1))
                         
-                    elif current_mode == "object":
-                        if idx in current_selections["object"]:
-                            current_selections["object"].remove(idx)
-                        else:
-                            current_selections["object"].append(idx)
-                            # Remove from other categories
-                            if idx in current_selections["subject"]:
-                                current_selections["subject"].remove(idx)
-                            if idx in current_selections["property"]:
-                                current_selections["property"].remove(idx)
-                    
-                    # Update session state
-                    st.session_state.word_selections[prop][sentence] = current_selections
-                
-                st.rerun()
+                        if current_mode == "subject":
+                            # Check if clicking on already selected subject words
+                            if all(i in current_selections["subject"] for i in selected_range):
+                                # Deselect the range
+                                for i in selected_range:
+                                    if i in current_selections["subject"]:
+                                        current_selections["subject"].remove(i)
+                            else:
+                                # Select the range and remove from object
+                                current_selections["subject"] = sorted(list(set(current_selections["subject"] + selected_range)))
+                                # Remove from object if any overlap
+                                for i in selected_range:
+                                    if i in current_selections["object"]:
+                                        current_selections["object"].remove(i)
+                        
+                        elif current_mode == "object":
+                            # Check if clicking on already selected object words
+                            if all(i in current_selections["object"] for i in selected_range):
+                                # Deselect the range
+                                for i in selected_range:
+                                    if i in current_selections["object"]:
+                                        current_selections["object"].remove(i)
+                            else:
+                                # Select the range and remove from subject
+                                current_selections["object"] = sorted(list(set(current_selections["object"] + selected_range)))
+                                # Remove from subject if any overlap
+                                for i in selected_range:
+                                    if i in current_selections["subject"]:
+                                        current_selections["subject"].remove(i)
+                        
+                        # Update session state
+                        st.session_state.word_selections[prop][sentence] = current_selections
+                        
+                        # Reset first word
+                        st.session_state[f"{key_prefix}_first_word"] = None
+                        st.rerun()
         
         # Start new row after 10 words
         if (idx + 1) % 10 == 0 and idx + 1 < len(words):
@@ -385,15 +416,12 @@ def render_word_selection_interface(sentence: str, selected_subject: List[int],
     st.markdown("---")
     st.markdown("#### Selected Words Summary")
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         subject_words = [words[i] for i in sorted(selected_subject)]
         st.markdown(f"**📘 Subject:** {' '.join(subject_words) if subject_words else '(none)'}")
     with col2:
-        property_words_list = [words[i] for i in sorted(selected_property)]
-        st.markdown(f"**📗 Property:** {' '.join(property_words_list) if property_words_list else '(none)'}")
-    with col3:
         object_words = [words[i] for i in sorted(selected_object)]
         st.markdown(f"**📙 Object:** {' '.join(object_words) if object_words else '(none)'}")
     
-    return current_mode, selected_subject, selected_property, selected_object
+    return current_mode, selected_subject, selected_object
