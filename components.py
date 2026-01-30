@@ -43,16 +43,34 @@ def render_property_header(prop: str, domain: str, range_val: str,
         else:
             st.markdown(f"**Range:** {range_val}")
 
-def render_progress_stats(current_idx: int, texts: List[str], labels: Dict[str, str]):
-    """Render progress and statistics information."""
-    total = len(texts)
-    labeled, _, percentage = calculate_stats(texts, labels)
-    
+def render_progress_stats(
+    current_idx: int,
+    texts: List[str],
+    labels: Dict[str, str],
+    full_property_total: Optional[int] = None,
+    full_property_labeled: Optional[int] = None,
+):
+    """
+    Render progress and statistics information.
+    When full_property_total and full_property_labeled are set (e.g. in unlabeled-only mode),
+    Progress shows position in current list and Labeled shows counts for the full property.
+    """
+    in_view_total = len(texts)
+    in_view_labeled, _, in_view_pct = calculate_stats(texts, labels)
+
     col1, col2 = st.columns([1, 2])
     with col1:
-        st.info(f"**Progress:** {current_idx + 1} / {total}")
+        st.info(f"**Progress:** {current_idx + 1} / {in_view_total} in list")
+        if full_property_total is not None and full_property_total != in_view_total:
+            st.caption(f"{in_view_total} in view · {full_property_total} total in property")
     with col2:
-        st.success(f"**Labeled:** {labeled} / {total} ({percentage}%)")
+        if full_property_total is not None and full_property_labeled is not None:
+            pct = round((full_property_labeled / full_property_total * 100.0), 2) if full_property_total else 0.0
+            st.success(
+                f"**Labeled (this property):** {full_property_labeled} / {full_property_total} ({pct}%)"
+            )
+        else:
+            st.success(f"**Labeled:** {in_view_labeled} / {in_view_total} ({in_view_pct}%)")
 
 def render_sentence_display(sentence: str):
     """Render the current sentence in a prominent display."""

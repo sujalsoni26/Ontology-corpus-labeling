@@ -80,6 +80,48 @@ def get_filtered_property_list():
     ]
 
 
+def _run_scroll_to_top():
+    """Scroll page to top after save. Tries st.html(unsafe_allow_javascript=True) (Streamlit 1.52+); fallback: scroll-to-top component button."""
+    scroll_html = """
+    <script>
+    (function() {
+        function scrollToTop() {
+            try {
+                document.body.scrollTop = 0;
+                document.documentElement.scrollTop = 0;
+                window.scrollTo(0, 0);
+                var app = document.querySelector('[data-testid="stAppViewContainer"]');
+                if (app) app.scrollTop = 0;
+                var main = document.querySelector('main');
+                if (main) main.scrollTop = 0;
+                if (window.parent && window.parent !== window) {
+                    window.parent.scrollTo(0, 0);
+                    var anchor = window.parent.document.getElementById('top-anchor');
+                    if (anchor) anchor.scrollIntoView({behavior: 'smooth', block: 'start'});
+                }
+                var anchor = document.getElementById('top-anchor');
+                if (anchor) anchor.scrollIntoView({behavior: 'smooth', block: 'start'});
+            } catch (e) {}
+        }
+        scrollToTop();
+        if (document.readyState !== 'complete') window.addEventListener('load', scrollToTop);
+        setTimeout(scrollToTop, 150);
+        setTimeout(scrollToTop, 500);
+    })();
+    </script>
+    """
+    try:
+        st.html(scroll_html, unsafe_allow_javascript=True)
+    except (TypeError, AttributeError):
+        st.markdown(scroll_html, unsafe_allow_html=True)
+    # Fallback: show a button so user can scroll to top if JS did not run (e.g. Streamlit < 1.52 or iframe)
+    try:
+        from streamlit_scroll_to_top import scroll_to_here
+        scroll_to_here(delay=0, key="scroll_after_save")
+    except Exception:
+        pass
+
+
 def get_filtered_texts(prop: str):
     """Sentence texts to show for a property (all, or only unlabeled-by-anyone)."""
     if not st.session_state.get("show_unlabeled_only"):
@@ -267,6 +309,10 @@ def render_labeling_interface():
     # Add scroll anchor at the top of labeling section
     st.markdown('<div id="top-anchor"></div>', unsafe_allow_html=True)
     
+    # On next run after "Save and next", scroll to top so user sees the new sentence from the start
+    if st.session_state.pop("scroll_to_top_after_save", False):
+        _run_scroll_to_top()
+    
     # Use filtered property list and texts (global unlabeled-only mode)
     filtered_property_list = get_filtered_property_list()
     if not filtered_property_list:
@@ -319,8 +365,21 @@ def render_labeling_interface():
     )
     st.markdown("---")
     
-    # Render progress and stats
-    render_progress_stats(current_idx, texts, st.session_state.labels[prop])
+    # Render progress and stats (use full property totals in unlabeled-only mode so Labeled reflects actual completion)
+    full_texts = st.session_state.data_raw[prop]["texts"]
+    full_total = len(full_texts)
+    full_labeled = sum(
+        1 for t in full_texts
+        if st.session_state.labels[prop].get(t, "") != ""
+    )
+    use_full_stats = st.session_state.get("show_unlabeled_only") and (full_total != len(texts))
+    render_progress_stats(
+        current_idx,
+        texts,
+        st.session_state.labels[prop],
+        full_property_total=full_total if use_full_stats else None,
+        full_property_labeled=full_labeled if use_full_stats else None,
+    )
     st.markdown("---")
     
     # Get current sentence and its label
@@ -383,56 +442,61 @@ def render_labeling_interface():
     st.markdown("#### 📋 Validation Status")
     
     if is_valid:
-        st.success("✅ **Label is complete!** This sentence is ready to be saved.")
+        st.success("✅ **Label is complete!** Click **Save and next** to save and move on.")
     elif error_message:
         st.warning(error_message)
     
-    # Convert word indices to comma-separated strings for database
+    st.markdown("---")
+    st.markdown("#### 💾 Save & navigate")
+    
+    # Save and next: persist to DB then advance to next sentence
     subject_str = ",".join(map(str, subject_list)) if subject_list else None
     object_str = ",".join(map(str, object_list)) if object_list else None
-    
-    # Save to database with new schema
-    # Look up sentence_id from database
     sentence_record = get_sentence_by_text(current_sentence, prop)
     
-    if sentence_record:
+    save_and_next_clicked = st.button("Save and next", type="primary", use_container_width=True, key="save_and_next_btn")
+    if save_and_next_clicked and sentence_record:
         sentence_id = sentence_record["id"]
-        
-        # Save label with validation status
         db_save_label_new(
             user_id=st.session_state.user_id,
             sentence_id=sentence_id,
             label_code=current_label_code if current_label_code else "",
             subject_words=subject_str,
             object_words=object_str,
-            is_complete=is_valid
+            is_complete=is_valid,
         )
-        # Keep global unlabeled-only view in sync: this sentence is now labeled by someone
-        if "labeled_sentence_ids" in st.session_state:
+        if is_valid and "labeled_sentence_ids" in st.session_state:
             st.session_state.labeled_sentence_ids.add(sentence_id)
-    else:
-        # Sentence not found in database - this shouldn't happen if migration ran correctly
-        st.error(f"⚠️ Sentence not found in database for property '{prop}'. Please contact admin.")
-
+        # Advance to next sentence (prefer next unlabeled)
+        next_idx = find_next_unlabeled(texts, st.session_state.labels[prop], current_idx)
+        if next_idx == current_idx and current_idx < len(texts) - 1:
+            next_idx = current_idx + 1
+        st.session_state.indices[prop] = next_idx
+        st.session_state["scroll_to_top_after_save"] = True
+        st.rerun()
+    elif save_and_next_clicked and not sentence_record:
+        st.error(f"⚠️ Sentence not found in database for property '{prop}'.")
     
     st.markdown("---")
     
-    # Navigation buttons
+    # Navigation buttons (no save; just move)
     prev_btn, next_btn, jump_prev_btn, jump_next_btn = render_navigation_buttons()
     
-    # Handle navigation
     if prev_btn and current_idx > 0:
         st.session_state.indices[prop] = current_idx - 1
+        st.session_state["scroll_to_top_after_save"] = True
         st.rerun()
     
     if next_btn and current_idx < len(texts) - 1:
         st.session_state.indices[prop] = current_idx + 1
+        st.session_state["scroll_to_top_after_save"] = True
         st.rerun()
     
     if jump_prev_btn:
         new_idx = find_prev_unlabeled(texts, st.session_state.labels[prop], current_idx)
         if new_idx != current_idx:
             st.session_state.indices[prop] = new_idx
+            st.session_state["scroll_to_top_after_save"] = True
             st.rerun()
         else:
             st.info("No previous unlabeled sentence found")
@@ -441,19 +505,11 @@ def render_labeling_interface():
         new_idx = find_next_unlabeled(texts, st.session_state.labels[prop], current_idx)
         if new_idx != current_idx:
             st.session_state.indices[prop] = new_idx
+            st.session_state["scroll_to_top_after_save"] = True
             st.rerun()
         else:
             st.info("No next unlabeled sentence found")
     
-    # Add JavaScript to scroll to top after page loads
-    st.markdown("""
-    <script>
-    // Scroll to top anchor
-    window.parent.document.getElementById('top-anchor')?.scrollIntoView({behavior: 'smooth', block: 'start'});
-    // Alternative: scroll to top of page
-    window.parent.scrollTo({top: 0, behavior: 'smooth'});
-    </script>
-    """, unsafe_allow_html=True)
 
 
 def render_my_labels_tab():
