@@ -1,0 +1,28 @@
+# Ignore database file (contains user data)
+labeling_data.db
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Streamlit cache
+.streamlit/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+venv/
+env/
+ENV/
+
+# Logs
+*.log
