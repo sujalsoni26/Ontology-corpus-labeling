@@ -533,6 +533,33 @@ def save_label(user_id: int, sentence_id: int, label_code: str,
     finally:
         conn.close()
 
+def get_sentence_ids_labeled_by_anyone() -> set:
+    """
+    Return the set of sentence IDs that have at least one label from any user.
+    Used for "unlabeled only" mode to show only sentences not yet labeled by anybody.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT sentence_id FROM labels")
+    ids = {row["sentence_id"] for row in cursor.fetchall()}
+    conn.close()
+    return ids
+
+
+def get_labeled_sentence_stats() -> Tuple[int, int]:
+    """
+    Return (total_sentences, labeled_by_anyone_count).
+    labeled_by_anyone_count = number of distinct sentences that have at least one label from any user.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) as c FROM sentences")
+    total = cursor.fetchone()["c"]
+    cursor.execute("SELECT COUNT(DISTINCT sentence_id) as c FROM labels")
+    labeled = cursor.fetchone()["c"]
+    conn.close()
+    return total, labeled
+
 def get_user_labels(user_id: int, property_name: Optional[str] = None) -> Dict[str, Dict[str, Dict]]:
     """
     Get all labels for a user, optionally filtered by property.
@@ -550,7 +577,7 @@ def get_user_labels(user_id: int, property_name: Optional[str] = None) -> Dict[s
     if property_name:
         cursor.execute("""
             SELECT p.property_name, s.sentence, l.label_code, l.subject_words, 
-                   l.object_words, l.is_complete
+                   l.object_words, l.is_complete, l.labeled_at, l.updated_at
             FROM labels l
             JOIN sentences s ON l.sentence_id = s.id
             JOIN properties p ON s.property_id = p.id
@@ -559,7 +586,7 @@ def get_user_labels(user_id: int, property_name: Optional[str] = None) -> Dict[s
     else:
         cursor.execute("""
             SELECT p.property_name, s.sentence, l.label_code, l.subject_words, 
-                   l.object_words, l.is_complete
+                   l.object_words, l.is_complete, l.labeled_at, l.updated_at
             FROM labels l
             JOIN sentences s ON l.sentence_id = s.id
             JOIN properties p ON s.property_id = p.id
@@ -581,7 +608,9 @@ def get_user_labels(user_id: int, property_name: Optional[str] = None) -> Dict[s
             "label_code": row["label_code"],
             "subject_words": row["subject_words"],
             "object_words": row["object_words"],
-            "is_complete": bool(row["is_complete"])
+            "is_complete": bool(row["is_complete"]),
+            "labeled_at": row["labeled_at"],
+            "updated_at": row["updated_at"],
         }
     
     return labels
