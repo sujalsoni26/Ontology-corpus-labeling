@@ -91,21 +91,51 @@ def render_legend():
 
 def render_login_form() -> Optional[str]:
     """
-    Render login form and return username if submitted.
+    Render login form with username and Google OAuth options.
     
     Returns:
         Username if form submitted, None otherwise
     """
     st.markdown("### 🔐 Login to Continue")
-    st.markdown("Please enter your username to access the labeling interface.")
+    st.markdown("Please choose a login method to access the labeling interface.")
     
+    # Google OAuth Login Button
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        try:
+            from google_oauth import get_authorization_url
+            
+            if st.button("🔐 Login with Google", type="primary", use_container_width=True, key="google_login_btn"):
+                # Get Google OAuth URL
+                auth_url = get_authorization_url()
+                
+                # Display link and instructions
+                st.markdown(f"""
+                ### Click the link below to login with Google:
+                
+                [🔗 Login with Google]({auth_url})
+                
+                After logging in, you'll be redirected back to this page.
+                """)
+                
+                # Store that we're waiting for OAuth callback
+                st.session_state.awaiting_oauth = True
+                
+        except Exception as e:
+            st.warning(f"Google OAuth not configured: {e}")
+            st.info("💡 To enable Google login, add your credentials to `.streamlit/secrets.toml`")
+    
+    st.markdown("---")
+    st.markdown("#### Or login with username")
+    
+    # Traditional username login
     with st.form("login_form"):
         username = st.text_input(
             "Username",
             placeholder="Enter your username",
             help="Your username will be used to track your labeling progress"
         )
-        submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("Login with Username", type="secondary", use_container_width=True)
         
         if submitted:
             if username and username.strip():
@@ -367,4 +397,3 @@ def render_word_selection_interface(sentence: str, selected_subject: List[int],
         st.markdown(f"**📙 Object:** {' '.join(object_words) if object_words else '(none)'}")
     
     return current_mode, selected_subject, selected_property, selected_object
-

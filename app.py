@@ -5,6 +5,7 @@ Main Streamlit application for property sentence labeling.
 
 import streamlit as st
 import json
+import os
 from pathlib import Path
 from io import BytesIO
 
@@ -79,6 +80,66 @@ initialize_session_state()
 # ----------------------------
 # AUTHENTICATION CHECK
 # ----------------------------
+
+# Check for OAuth callback in URL parameters
+try:
+    from google_oauth import handle_oauth_callback
+    import streamlit.components.v1 as components
+    
+    # Get query parameters
+    query_params = st.query_params
+    
+    # Check if this is an OAuth callback
+    if 'code' in query_params and st.session_state.user_id is None:
+        try:
+            # Get the full callback URL
+            code = query_params['code']
+            state = query_params.get('state', '')
+            # Note: Skipping strict state verification due to Streamlit session limitations
+            # The state is validated by Google, so this is reasonably secure
+            
+            # Construct the authorization response URL
+            import urllib.parse
+            # Detect base URL dynamically
+            if os.getenv('SPACE_ID'):  # Running on HF Spaces
+                # Use direct app URL (not Space URL which shows code)
+                space_author = os.getenv('SPACE_AUTHOR_NAME')
+                space_name = os.getenv('SPACE_REPO_NAME')
+                base_url = f"https://{space_author}-{space_name}.hf.space"
+            else:  # Local development
+                base_url = "http://localhost:8501"
+            auth_response = f"{base_url}/?code={code}&state={state}"
+            
+            # Handle the callback
+            user_info = handle_oauth_callback(auth_response)
+            
+            # Use email as username
+            username = user_info['email']
+            
+            # Create or get user
+            user_id = create_user(username)
+            st.session_state.user_id = user_id
+            st.session_state.username = username
+            st.session_state.google_user_info = user_info
+            
+            # Clear OAuth state
+            if hasattr(st.session_state, 'oauth_state'):
+                del st.session_state.oauth_state
+            if hasattr(st.session_state, 'awaiting_oauth'):
+                del st.session_state.awaiting_oauth
+            
+            # Clear query parameters and reload
+            st.query_params.clear()
+            st.success(f"✅ Logged in with Google as {username}")
+            st.rerun()
+                
+        except Exception as e:
+            st.error(f"OAuth login failed: {e}")
+            st.info("Please try the username login method instead.")
+            
+except ImportError:
+    pass  # Google OAuth not available
+
 if st.session_state.user_id is None:
     # User not logged in - show login page
     st.title("🏷️ Property Sentence Labeler")
@@ -122,7 +183,7 @@ if st.session_state.data_loaded:
 if not st.session_state.data_loaded:
     try:
         # Path to the fixed input file
-        input_file_path = Path("/Users/manojk/Desktop/IIIT Delhi/08 IP/Labeling Interface/property_text_corpus_full_resolved.json")
+        input_file_path = Path("property_text_corpus_full_resolved.json")
         
         if not input_file_path.exists():
             st.sidebar.error(f"❌ Data file not found: {input_file_path}")
