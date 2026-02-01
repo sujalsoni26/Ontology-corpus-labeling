@@ -37,8 +37,6 @@ from database import (
     get_sentences_by_property,
     get_sentence_by_text,
     get_all_properties,
-    get_sentence_ids_labeled_by_anyone,
-    get_labeled_sentence_stats,
 )
 
 from validation import (
@@ -65,18 +63,39 @@ def initialize_data():
         st.session_state.property_list = []
     if "data_loaded" not in st.session_state:
         st.session_state.data_loaded = False
-    if "show_unlabeled_only" not in st.session_state:
-        st.session_state.show_unlabeled_only = True  # Default: show only sentences not labeled by anybody
+    # Filter by global label_count: "up_to" N (count <= N), "exactly" K (count == K), or "all". Checked at login.
+    if "label_filter_mode" not in st.session_state:
+        st.session_state.label_filter_mode = "up_to"  # Default: unlabeled only
+    if "label_filter_value" not in st.session_state:
+        st.session_state.label_filter_value = 0
+    if "hide_properties_with_none_below_threshold" not in st.session_state:
+        st.session_state.hide_properties_with_none_below_threshold = True
+
+
+def _sentence_matches_filter(prop: str, sentence_id: int) -> bool:
+    """True if sentence's global label_count matches the current filter (up_to N, exactly K, or all)."""
+    mode = st.session_state.get("label_filter_mode", "up_to")
+    value = st.session_state.get("label_filter_value", 0)
+    if mode == "all":
+        return True
+    count = st.session_state.data_raw[prop].get("label_counts", {}).get(sentence_id, 0)
+    if mode == "up_to":
+        return count <= value
+    if mode == "exactly":
+        return count == value
+    return True
 
 
 def get_filtered_property_list():
-    """Properties that have at least one sentence to show (all, or only unlabeled-by-anyone)."""
-    if not st.session_state.get("show_unlabeled_only"):
+    """Properties to show: optionally hide properties with no sentences matching the current filter."""
+    if st.session_state.get("label_filter_mode") == "all":
         return st.session_state.property_list
-    labeled_ids = st.session_state.get("labeled_sentence_ids", set())
+    hide_empty = st.session_state.get("hide_properties_with_none_below_threshold", True)
+    if not hide_empty:
+        return st.session_state.property_list
     return [
         prop for prop in st.session_state.property_list
-        if any(sid not in labeled_ids for sid in st.session_state.data_raw[prop].get("sentence_ids", []))
+        if any(_sentence_matches_filter(prop, sid) for sid in st.session_state.data_raw[prop].get("sentence_ids", []))
     ]
 
 
@@ -123,22 +142,19 @@ def _run_scroll_to_top():
 
 
 def get_filtered_texts(prop: str):
-    """Sentence texts to show for a property (all, or only unlabeled-by-anyone)."""
-    if not st.session_state.get("show_unlabeled_only"):
-        return st.session_state.data_raw[prop]["texts"]
-    labeled_ids = st.session_state.get("labeled_sentence_ids", set())
+    """Sentence texts to show for a property: those matching the current filter (up_to N, exactly K, or all)."""
     texts = st.session_state.data_raw[prop]["texts"]
     ids = st.session_state.data_raw[prop].get("sentence_ids", [])
-    return [t for t, sid in zip(texts, ids) if sid not in labeled_ids]
+    return [t for t, sid in zip(texts, ids) if _sentence_matches_filter(prop, sid)]
 
 
 def load_data_from_database():
-    """Load data from database (properties and sentences)."""
-    # If we have cached data but no sentence_ids (e.g. session from before unlabeled-only mode),
-    # force a reload so filtering works correctly.
+    """Load data from database (properties and sentences). Filter by global label_count < threshold (checked once at login)."""
+    # Force reload if cached data lacks sentence_ids or label_counts (e.g. from before threshold-based filtering).
     if st.session_state.data_loaded and st.session_state.property_list:
         first_prop = st.session_state.property_list[0]
-        if not st.session_state.data_raw.get(first_prop, {}).get("sentence_ids"):
+        raw = st.session_state.data_raw.get(first_prop, {})
+        if not raw.get("sentence_ids") or "label_counts" not in raw:
             st.session_state.data_loaded = False
     if st.session_state.data_loaded:
         return
@@ -154,7 +170,7 @@ def load_data_from_database():
             st.session_state.data_loaded = False
             return
         
-        # Build data structure with sentence IDs (for global unlabeled-only filtering)
+        # Build data structure with sentence IDs and global label_count per sentence (for threshold filtering)
         st.session_state.data_raw = {}
         st.session_state.property_list = []
         
@@ -162,7 +178,7 @@ def load_data_from_database():
             prop_name = prop["property_name"]
             st.session_state.property_list.append(prop_name)
             
-            # Get sentences for this property (keep ids for filtering)
+            # Get sentences for this property (each has id, sentence, label_count from DB)
             sentences = get_sentences_by_property(prop["id"])
             
             st.session_state.data_raw[prop_name] = {
@@ -170,6 +186,7 @@ def load_data_from_database():
                 "range": prop["property_range"] or "",
                 "texts": [s["sentence"] for s in sentences],
                 "sentence_ids": [s["id"] for s in sentences],
+                "label_counts": {s["id"]: s.get("label_count", 0) for s in sentences},
                 "property_iri": prop.get("property_iri"),
                 "domain_iri": prop.get("domain_iri"),
                 "range_iri": prop.get("range_iri")
@@ -177,9 +194,6 @@ def load_data_from_database():
         
         # Sort property list
         st.session_state.property_list = sorted(st.session_state.property_list)
-        
-        # Load set of sentence IDs that have been labeled by any user (for unlabeled-only mode)
-        st.session_state.labeled_sentence_ids = get_sentence_ids_labeled_by_anyone()
         
         # Initialize labels structure
         st.session_state.labels = initialize_labels(st.session_state.data_raw)
@@ -241,46 +255,99 @@ def render_sidebar():
     user_stats = get_user_stats(st.session_state.user_id)
     render_user_info(st.session_state.username, user_stats)
     
-    # Global mode: show only sentences not labeled by anybody (default)
+    # Display mode: Up to N labels / Exactly K labels / All (counts fixed at login)
     if st.session_state.data_loaded:
         st.sidebar.markdown("---")
         st.sidebar.subheader("🌐 Display mode")
-        mode_options = ["Unlabeled only (default)", "All sentences"]
-        mode_index = 0 if st.session_state.show_unlabeled_only else 1
-        new_mode = st.sidebar.selectbox(
-            "Show properties and sentences",
-            options=mode_options,
-            index=mode_index,
+        filter_type_options = ["Up to N labels", "Exactly K labels", "All sentences"]
+        current_mode = st.session_state.get("label_filter_mode", "up_to")
+        current_value = st.session_state.get("label_filter_value", 0)
+        mode_to_option = {"up_to": "Up to N labels", "exactly": "Exactly K labels", "all": "All sentences"}
+        option_to_mode = {v: ("up_to" if v == "Up to N labels" else "exactly" if v == "Exactly K labels" else "all") for v in filter_type_options}
+        try:
+            type_index = filter_type_options.index(mode_to_option.get(current_mode, "Up to N labels"))
+        except ValueError:
+            type_index = 0
+        new_type = st.sidebar.selectbox(
+            "Show sentences with",
+            options=filter_type_options,
+            index=type_index,
             key="global_display_mode",
-            help="Unlabeled only: only properties and sentences that have not been labeled by any user. All: show everything."
+            help="Up to N: sentences with 0..N complete labelings. Exactly K: sentences with exactly K labelings. Counts are fixed at login."
         )
-        if (new_mode == "Unlabeled only (default)") != st.session_state.show_unlabeled_only:
-            st.session_state.show_unlabeled_only = (new_mode == "Unlabeled only (default)")
-            # Reset indices and current_prop so we don't point to wrong sentence after filter change
+        new_mode = option_to_mode[new_type]
+        new_value = current_value
+        if new_mode in ("up_to", "exactly"):
+            label_n = st.sidebar.number_input(
+                "N" if new_mode == "up_to" else "K",
+                min_value=0,
+                max_value=100,
+                value=current_value,
+                step=1,
+                key="label_filter_value_input",
+                help="Up to N: show sentences with 0 to N labels. Exactly K: show only sentences with exactly K labels."
+            )
+            new_value = int(label_n)
+        filter_changed = (new_mode != current_mode) or (new_value != current_value)
+        if filter_changed:
+            st.session_state.label_filter_mode = new_mode
+            st.session_state.label_filter_value = new_value
             filtered_props = get_filtered_property_list()
             for prop in st.session_state.property_list:
                 texts = get_filtered_texts(prop)
                 st.session_state.indices[prop] = find_first_unlabeled(texts, st.session_state.labels[prop]) if texts else 0
-            st.session_state.current_prop = filtered_props[0] if filtered_props else (st.session_state.property_list[0] if st.session_state.property_list else None)
+            current_prop = st.session_state.current_prop
+            if filtered_props and current_prop in filtered_props:
+                st.session_state.current_prop = current_prop
+            else:
+                st.session_state.current_prop = filtered_props[0] if filtered_props else (st.session_state.property_list[0] if st.session_state.property_list else None)
+            st.rerun()
+        hide_empty = st.sidebar.checkbox(
+            "Hide properties with no matching sentences",
+            value=st.session_state.get("hide_properties_with_none_below_threshold", True),
+            key="hide_properties_below_threshold",
+            help="When enabled, properties with no sentences matching the current filter are hidden."
+        )
+        if hide_empty != st.session_state.get("hide_properties_with_none_below_threshold", True):
+            st.session_state.hide_properties_with_none_below_threshold = hide_empty
+            filtered_props = get_filtered_property_list()
+            for prop in st.session_state.property_list:
+                texts = get_filtered_texts(prop)
+                st.session_state.indices[prop] = find_first_unlabeled(texts, st.session_state.labels[prop]) if texts else 0
+            current_prop = st.session_state.current_prop
+            if filtered_props and current_prop in filtered_props:
+                st.session_state.current_prop = current_prop
+            else:
+                st.session_state.current_prop = filtered_props[0] if filtered_props else (st.session_state.property_list[0] if st.session_state.property_list else None)
             st.rerun()
     
-    # Show dataset statistics if data is loaded (filtered when in unlabeled-only mode)
+    # Show dataset statistics (counts from data loaded at login)
     if st.session_state.data_loaded:
         st.sidebar.markdown("---")
         st.sidebar.subheader("📊 Dataset Statistics")
         filtered_props = get_filtered_property_list()
         visible_sentences = sum(len(get_filtered_texts(prop)) for prop in filtered_props)
         st.sidebar.metric("Properties", len(filtered_props))
-        st.sidebar.metric("Total Sentences", visible_sentences)
-        if st.session_state.show_unlabeled_only:
-            total_in_db, labeled_by_anyone = get_labeled_sentence_stats()
-            unlabeled_count = total_in_db - labeled_by_anyone
-            st.sidebar.caption(
-                f"**Labeling stats:** {total_in_db} total sentences · "
-                f"**{labeled_by_anyone}** labeled by at least one user · **{unlabeled_count}** unlabeled."
+        st.sidebar.metric("Total Sentences (in view)", visible_sentences)
+        mode = st.session_state.get("label_filter_mode", "up_to")
+        value = st.session_state.get("label_filter_value", 0)
+        if mode != "all":
+            total_in_db = sum(len(st.session_state.data_raw[p]["texts"]) for p in st.session_state.property_list)
+            count_matching = sum(
+                1 for p in st.session_state.property_list
+                for sid in st.session_state.data_raw[p].get("sentence_ids", [])
+                if _sentence_matches_filter(p, sid)
             )
-            if unlabeled_count == 0 and total_in_db > 0:
-                st.sidebar.info("All sentences have been labeled by someone. Switch to **All sentences** to view or edit them.")
+            if mode == "up_to":
+                st.sidebar.caption(
+                    f"**Label count (at login):** {total_in_db} total · **{count_matching}** with ≤ {value} label(s)."
+                )
+            else:
+                st.sidebar.caption(
+                    f"**Label count (at login):** {total_in_db} total · **{count_matching}** with exactly {value} label(s)."
+                )
+            if count_matching == 0 and total_in_db > 0:
+                st.sidebar.info("No sentences match the filter. Change N/K or switch to **All sentences**, or reload after more labeling.")
     
     # Export functionality
     if st.session_state.data_loaded:
@@ -365,14 +432,14 @@ def render_labeling_interface():
     )
     st.markdown("---")
     
-    # Render progress and stats (use full property totals in unlabeled-only mode so Labeled reflects actual completion)
+    # Render progress and stats (use full property totals when view is filtered by threshold)
     full_texts = st.session_state.data_raw[prop]["texts"]
     full_total = len(full_texts)
     full_labeled = sum(
         1 for t in full_texts
         if st.session_state.labels[prop].get(t, "") != ""
     )
-    use_full_stats = st.session_state.get("show_unlabeled_only") and (full_total != len(texts))
+    use_full_stats = (st.session_state.get("label_filter_mode") != "all") and (full_total != len(texts))
     render_progress_stats(
         current_idx,
         texts,
@@ -465,9 +532,7 @@ def render_labeling_interface():
             object_words=object_str,
             is_complete=is_valid,
         )
-        if is_valid and "labeled_sentence_ids" in st.session_state:
-            st.session_state.labeled_sentence_ids.add(sentence_id)
-        # Advance to next sentence (prefer next unlabeled)
+        # Advance to next sentence (prefer next unlabeled). No in-session update of label_count; checked at login only.
         next_idx = find_next_unlabeled(texts, st.session_state.labels[prop], current_idx)
         if next_idx == current_idx and current_idx < len(texts) - 1:
             next_idx = current_idx + 1
