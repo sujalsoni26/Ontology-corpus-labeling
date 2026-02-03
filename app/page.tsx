@@ -5,10 +5,8 @@ import { Button } from "@/components/ui/button"
 import { Tag, ArrowRight } from "lucide-react"
 
 export default async function HomePage() {
-  console.log("[v0] HomePage rendering")
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
-  console.log("[v0] User check complete:", user ? "logged in" : "not logged in")
 
   if (user) {
     redirect("/labeler")
